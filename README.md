@@ -90,9 +90,7 @@ sidewalk-centerline-navigation/
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/sidewalk-centerline-navigation.git
-cd sidewalk-centerline-navigation
-pip install -r requirements.txt
+uv sync
 ```
 
 ---
@@ -130,8 +128,30 @@ navigator.save_results("results/run_output.csv")
 Or run the ready-made example script:
 
 ```bash
-python examples/run_example.py
+uv run python examples/run_example.py
 ```
+
+The example uses `data/example.las` when present, deriving a start and goal
+from its navigable points. Otherwise it looks for
+`SlamProject-35-03_classified_with_modelclass.laz` in the neighboring
+`Data Samples/LiDAR Recordings/classified_litept-l-mls-5cm/` folder. To use
+another recording:
+
+```bash
+uv run python examples/run_example.py --input /path/to/recording.laz
+```
+
+For very large recordings, limit the randomly sampled points to reduce memory
+use:
+
+```bash
+uv run python examples/run_example.py --input /path/to/recording.laz --max-points 4000000
+```
+
+The supplied `*_with_modelclass.laz` recordings use `ModelClass=1` for ground.
+The navigator also recognizes the paper dataset's `Label` field and standard
+LAS `classification` (class 2 = ground). For other class maps, set
+`NavigationConfig.navigable_classes` explicitly.
 
 ---
 
