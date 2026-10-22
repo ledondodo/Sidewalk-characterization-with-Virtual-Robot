@@ -1,9 +1,11 @@
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
+import heapq
 import numpy as np
 import laspy
 import pandas as pd
+from scipy.ndimage import binary_closing, distance_transform_edt
 from scipy.spatial import KDTree
 
 
@@ -13,6 +15,7 @@ class NavigationState(Enum):
     NAVIGATE_BETWEEN = 3
     AVOID_OBSTACLE = 4
     GOAL_REACHED = 5
+    BLOCKED = 6
 
 
 @dataclass
@@ -28,7 +31,9 @@ class NavigationConfig:
     goal_tolerance: float = 0.2             # how close to the goal is considered “reached” (m)
 
     # Point cloud parameters
-    navigable_classes: List[float] = [1111.00, 1112.00, 1113.00, 1114.00, 1115.00, 1116.00, 1810.00]
+    navigable_classes: List[float] = field(
+        default_factory=lambda: [1111.00, 1112.00, 1113.00, 1114.00, 1115.00, 1116.00, 1810.00]
+    )
     open_space_grid_size: float = 0.05      # spatial resolution used when checking free space
     point_density: float = 0.05
 
@@ -107,18 +112,88 @@ class CenterlineNavigator:
         self.path_points: List[np.ndarray] = []
         self.terrain_features: List[TerrainFeatures] = []
         self.step_counter = 0
+        self.planned_route: Optional[np.ndarray] = None
+        self.route_index = 0
+        self.route_grid: Optional[np.ndarray] = None
+        self.route_grid_origin: Optional[np.ndarray] = None
+        self.route_grid_size: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Point cloud loading
     # ------------------------------------------------------------------
-    def load_point_cloud(self, las_file_path: str):
+    def load_point_cloud(
+        self,
+        las_file_path: str,
+        max_points: Optional[int] = None,
+        bounds: Optional[Tuple[float, float, float, float]] = None,
+    ):
         print(f"Loading point cloud from {las_file_path}...")
-        las_file = laspy.read(las_file_path)
+        reader = laspy.open(las_file_path)
+        total_points = reader.header.point_count
+        dimensions = set(reader.header.point_format.dimension_names)
+        class_field = next(
+            (name for name in ("Label", "ModelClass", "classification") if name in dimensions),
+            None,
+        )
+        if class_field is None:
+            raise ValueError(
+                "No semantic class dimension found. Expected `Label`, `ModelClass`, "
+                "or LAS `classification`."
+            )
+        navigable_classes = self.config.navigable_classes
+        if class_field == "ModelClass" and navigable_classes == [1111.00, 1112.00, 1113.00, 1114.00, 1115.00, 1116.00, 1810.00]:
+            navigable_classes = [1]  # sample-data model legend: 1 = ground
+            print("Using ModelClass=1 as the navigable ground surface")
+        elif class_field == "classification" and navigable_classes == [1111.00, 1112.00, 1113.00, 1114.00, 1115.00, 1116.00, 1810.00]:
+            navigable_classes = [2]  # LAS standard: 2 = ground
+            print("Using LAS classification=2 as the navigable ground surface")
+        # Keep all later navigation queries consistent with the selected field.
+        self.config.navigable_classes = list(navigable_classes)
 
-        points = np.vstack([las_file.x, las_file.y, las_file.z]).T
-        classifications = np.array(las_file.Label, dtype=np.float32)
+        # Read in chunks so large LAZ files can be sampled without first
+        # expanding the entire recording in memory.
+        rng = np.random.default_rng(42)
+        stride = max(1, int(np.ceil(total_points / max_points))) if max_points else 1
+        point_chunks = []
+        class_chunks = []
+        for las_chunk in reader.chunk_iterator(1_000_000):
+            x_all = np.asarray(las_chunk.x)
+            y_all = np.asarray(las_chunk.y)
+            if bounds is None:
+                selected = np.arange(len(las_chunk))
+            else:
+                xmin, ymin, xmax, ymax = bounds
+                selected = np.flatnonzero(
+                    (x_all >= xmin) & (x_all <= xmax)
+                    & (y_all >= ymin) & (y_all <= ymax)
+                )
+            if stride > 1 and len(selected) > 1:
+                count = max(1, int(round(len(selected) / stride)))
+                selected = np.sort(rng.choice(selected, size=count, replace=False))
+            if len(selected) == 0:
+                continue
+            x = x_all[selected]
+            y = y_all[selected]
+            z = np.asarray(las_chunk.z[selected])
+            cls = np.asarray(getattr(las_chunk, class_field)[selected], dtype=np.float32)
+            point_chunks.append(np.column_stack((x, y, z)))
+            class_chunks.append(cls)
+        reader.close()
+        if not point_chunks:
+            raise ValueError("No points found in the requested spatial bounds")
+        points = np.concatenate(point_chunks, axis=0)
+        classifications = np.concatenate(class_chunks, axis=0)
+        if stride > 1:
+            print(f"Sampled {len(points)} of {total_points} points (max_points={max_points})")
+        elif bounds is not None:
+            print(f"Loaded {len(points)} points in the requested spatial bounds")
 
-        navigable_mask = np.isin(classifications, self.config.navigable_classes)
+        navigable_mask = np.isin(classifications, navigable_classes)
+        if not np.any(navigable_mask):
+            raise ValueError(
+                f"No points match navigable classes {navigable_classes} in `{class_field}`. "
+                "Set NavigationConfig.navigable_classes to the class values for this file."
+            )
         self.navigable_points = points[navigable_mask]
         self.obstacle_points = points[~navigable_mask]
 
@@ -134,7 +209,7 @@ class CenterlineNavigator:
             "classifications": classifications,
         }
 
-        print(f"Loaded {len(points)} points")
+        print(f"Loaded {len(points)} points ({class_field})")
         print(f"Navigable points: {len(self.navigable_points)}")
         print(f"Obstacle points: {len(self.obstacle_points)}")
 
@@ -198,20 +273,146 @@ class CenterlineNavigator:
     # Navigable / obstacle queries (sidewalk edges act as walls)
     # ------------------------------------------------------------------
     def is_on_navigable_surface(self, position: np.ndarray) -> bool:
-        d, idx = self.kdtree.query(position, k=1)
-        if isinstance(d, np.ndarray):
-            d = d[0] if len(d) > 0 else np.inf
-            idx = idx[0] if len(idx) > 0 else -1
-        if d < 0.1 and idx >= 0:
-            cls = self.point_cloud["classifications"][idx]
-            if hasattr(cls, "item"):
-                cls_val = float(cls.item())
-            elif hasattr(cls, "__iter__") and not isinstance(cls, str):
-                cls_val = float(list(cls)[0])
-            else:
-                cls_val = float(cls)
-            return cls_val in self.config.navigable_classes
-        return False
+        # Query the navigable tree directly. Looking up the nearest point in
+        # the all-points tree can reject a valid ground point whenever a
+        # nearby non-ground label is marginally closer (common at 5 cm density).
+        if self.navigable_kdtree is None:
+            return False
+        distance, _ = self.navigable_kdtree.query(position, k=1)
+        return bool(distance < 0.1)
+
+    def is_safe_segment(self, start: np.ndarray, end: np.ndarray) -> bool:
+        """Require the entire robot step to stay within classified ground."""
+        length = float(np.linalg.norm(end[:2] - start[:2]))
+        sample_count = max(1, int(np.ceil(length / 0.05)))
+        for fraction in np.linspace(0.0, 1.0, sample_count + 1):
+            sample = start + fraction * (end - start)
+            if self.route_grid is not None:
+                cell = np.floor(
+                    (sample[:2] - self.route_grid_origin) / self.route_grid_size
+                ).astype(int)
+                if not (
+                    0 <= cell[0] < self.route_grid.shape[1]
+                    and 0 <= cell[1] < self.route_grid.shape[0]
+                    and self.route_grid[cell[1], cell[0]]
+                ):
+                    return False
+                continue
+            sample = self.conform_to_surface(sample)
+            if not self.is_on_navigable_surface(sample):
+                return False
+        return True
+
+    def plan_ground_route(self, grid_size: float = 0.2) -> np.ndarray:
+        """Plan a global A* route through ground cells with robot clearance."""
+        if self.navigable_points is None or self.current_position is None:
+            raise RuntimeError("Load the point cloud and initialize start/goal first")
+
+        points = self.navigable_points
+        origin = points[:, :2].min(axis=0) - grid_size
+        shape_xy = np.ceil((points[:, :2].max(axis=0) - origin) / grid_size).astype(int) + 1
+        occupied = np.zeros((shape_xy[1], shape_xy[0]), dtype=bool)
+        cells = np.floor((points[:, :2] - origin) / grid_size).astype(int)
+        occupied[cells[:, 1], cells[:, 0]] = True
+        # Fill only sub-grid acquisition gaps; building footprints remain
+        # disconnected because their empty regions are many cells wide.
+        occupied = binary_closing(occupied, structure=np.ones((3, 3), dtype=bool))
+
+        clearance = distance_transform_edt(occupied) * grid_size
+        required_clearance = self.config.robot_width / 2.0
+        traversable = occupied & (clearance >= required_clearance)
+        traversable_points = np.argwhere(traversable)
+        if len(traversable_points) == 0:
+            raise ValueError("No ground cells have enough clearance for the robot")
+
+        centers_xy = origin + (traversable_points[:, ::-1] + 0.5) * grid_size
+        cell_tree = KDTree(centers_xy)
+        start_cell_idx = int(cell_tree.query(self.current_position[:2])[1])
+        goal_cell_idx = int(cell_tree.query(self.goal_position[:2])[1])
+        start_cell = tuple(traversable_points[start_cell_idx])
+        goal_cell = tuple(traversable_points[goal_cell_idx])
+
+        start_snap = np.linalg.norm(centers_xy[start_cell_idx] - self.current_position[:2])
+        goal_snap = np.linalg.norm(centers_xy[goal_cell_idx] - self.goal_position[:2])
+        if start_snap > 2.0 or goal_snap > 2.0:
+            raise ValueError(
+                f"Could not connect start/goal to a clear ground cell "
+                f"(snaps {start_snap:.2f}m, {goal_snap:.2f}m)"
+            )
+
+        directions = [
+            (-1, -1, np.sqrt(2.0)), (-1, 0, 1.0), (-1, 1, np.sqrt(2.0)),
+            (0, -1, 1.0), (0, 1, 1.0),
+            (1, -1, np.sqrt(2.0)), (1, 0, 1.0), (1, 1, np.sqrt(2.0)),
+        ]
+        frontier = [(0.0, start_cell)]
+        came_from = {start_cell: None}
+        cost_so_far = {start_cell: 0.0}
+        while frontier:
+            _, current = heapq.heappop(frontier)
+            if current == goal_cell:
+                break
+            for dy, dx, step_cost in directions:
+                nxt = (current[0] + dy, current[1] + dx)
+                if not (0 <= nxt[0] < occupied.shape[0] and 0 <= nxt[1] < occupied.shape[1]):
+                    continue
+                if not traversable[nxt]:
+                    continue
+                if dx and dy and (not traversable[current[0], nxt[1]] or not traversable[nxt[0], current[1]]):
+                    continue
+                local_clearance = max(clearance[nxt] - required_clearance, grid_size)
+                new_cost = cost_so_far[current] + step_cost * (1.0 + 0.15 / local_clearance)
+                if nxt not in cost_so_far or new_cost < cost_so_far[nxt]:
+                    cost_so_far[nxt] = new_cost
+                    heuristic = np.hypot(goal_cell[0] - nxt[0], goal_cell[1] - nxt[1])
+                    heapq.heappush(frontier, (new_cost + heuristic, nxt))
+                    came_from[nxt] = current
+
+        if goal_cell not in came_from:
+            raise ValueError("No connected ground route with robot clearance exists between these endpoints")
+
+        self.route_grid = traversable
+        self.route_grid_origin = origin
+        self.route_grid_size = grid_size
+
+        grid_path = []
+        cell = goal_cell
+        while cell is not None:
+            grid_path.append(cell)
+            cell = came_from[cell]
+        grid_path.reverse()
+        xy_path = origin + (np.asarray(grid_path)[:, ::-1] + 0.5) * grid_size
+        route = [self.current_position.copy()]
+        route.extend(
+            self.conform_to_surface(np.array([xy[0], xy[1], self.current_position[2]]))
+            for xy in xy_path
+        )
+        route.append(self.goal_position.copy())
+
+        # Resample the A* polyline at the robot's step length.
+        sampled = [route[0]]
+        remaining = self.config.step_size
+        for a, b in zip(route[:-1], route[1:]):
+            segment = b - a
+            length = float(np.linalg.norm(segment[:2]))
+            if length < 1e-9:
+                continue
+            direction = segment / length
+            travelled = 0.0
+            while length - travelled >= remaining:
+                travelled += remaining
+                sampled.append(a + direction * travelled)
+                remaining = self.config.step_size
+            remaining -= length - travelled
+        if np.linalg.norm(sampled[-1] - route[-1]) > 1e-6:
+            sampled.append(route[-1])
+        self.planned_route = np.asarray(sampled)
+        self.route_index = 1 if len(sampled) > 1 else 0
+        print(
+            f"Planned ground route: {len(self.planned_route)} waypoints, "
+            f"{sum(np.linalg.norm(b[:2] - a[:2]) for a, b in zip(self.planned_route[:-1], self.planned_route[1:])):.2f}m"
+        )
+        return self.planned_route
 
     def cast_ray(
         self, origin: np.ndarray, direction: np.ndarray, max_distance: float = None
@@ -511,6 +712,22 @@ class CenterlineNavigator:
     def centerline_navigation_step(self) -> bool:
         cfg = self.config
 
+        if self.planned_route is not None:
+            if self.route_index >= len(self.planned_route):
+                self.state = NavigationState.GOAL_REACHED
+                return True
+            next_pos = self.planned_route[self.route_index]
+            delta = next_pos - self.current_position
+            delta[2] = 0.0
+            self.current_heading = delta / (np.linalg.norm(delta) + 1e-6)
+            if not self.is_safe_segment(self.current_position, next_pos):
+                self.state = NavigationState.BLOCKED
+                return True
+            self.state = NavigationState.FOLLOW_CENTERLINE
+            self.current_position = self.conform_to_surface(next_pos)
+            self.route_index += 1
+            return False
+
         dist_goal = np.linalg.norm(self.goal_position - self.current_position)
 
         # If we are very close: just go straight to goal, ignore centerline
@@ -548,25 +765,50 @@ class CenterlineNavigator:
                 self.state = NavigationState.AVOID_OBSTACLE
             else:
                 self.state = NavigationState.FOLLOW_CENTERLINE
+            # `find_centerline_direction` already evaluates candidate forward
+            # directions against the goal and the available passage. Rotating
+            # that result toward a perpendicular whenever one side is close
+            # to an obstacle discards the goal direction and can make the
+            # robot circle in place at narrow or noisy sections.
 
-            if self.state == NavigationState.AVOID_OBSTACLE:
-                if left > right:
-                    perp = np.array(
-                        [-self.current_heading[1], self.current_heading[0], 0.0]
-                    )
-                else:
-                    perp = np.array(
-                        [self.current_heading[1], -self.current_heading[0], 0.0]
-                    )
-                self.current_heading = 0.95 * self.current_heading + 0.05 * perp
-                self.current_heading /= np.linalg.norm(self.current_heading) + 1e-6
+        # Validate the complete step, not just its endpoint. If the preferred
+        # heading crosses a gap, try nearby ground-supported headings before
+        # declaring the route blocked.
+        goal_vec = self.goal_position - self.current_position
+        goal_vec[2] = 0.0
+        goal_vec /= np.linalg.norm(goal_vec) + 1e-6
+        candidate_headings = [self.current_heading]
+        offsets = np.radians(np.arange(10.0, 181.0, 10.0))
+        for offset in offsets:
+            for sign in (-1.0, 1.0):
+                angle = sign * offset
+                ca, sa = np.cos(angle), np.sin(angle)
+                heading = np.array([
+                    ca * self.current_heading[0] - sa * self.current_heading[1],
+                    sa * self.current_heading[0] + ca * self.current_heading[1],
+                    0.0,
+                ])
+                candidate_headings.append(heading)
 
-        # Move step (same as before)
-        next_pos = self.current_position + self.current_heading * cfg.step_size
-        if not self.is_on_navigable_surface(next_pos):
-            alt_dir = self.find_centerline_direction(self.current_position)
-            next_pos = self.current_position + alt_dir * cfg.step_size
+        safe_candidates = []
+        for heading in candidate_headings:
+            if np.dot(heading, goal_vec) <= 0.0:
+                continue
+            next_pos = self.current_position + heading * cfg.step_size
+            if self.is_safe_segment(self.current_position, next_pos):
+                # Prefer progress toward the goal, with a small continuity
+                # preference to avoid abrupt changes between safe steps.
+                score = 2.0 * np.dot(heading, goal_vec) + 0.25 * np.dot(
+                    heading, self.current_heading
+                )
+                safe_candidates.append((score, heading, next_pos))
 
+        if not safe_candidates:
+            self.state = NavigationState.BLOCKED
+            return True
+
+        _, chosen_heading, next_pos = max(safe_candidates, key=lambda item: item[0])
+        self.current_heading = chosen_heading
         self.current_position = self.conform_to_surface(next_pos)
         return False
 
@@ -667,6 +909,11 @@ class CenterlineNavigator:
         for step in range(max_steps):
             self.step_counter = step
 
+            if self.planned_route is not None and self.route_index < len(self.planned_route):
+                delta = self.planned_route[self.route_index] - self.current_position
+                delta[2] = 0.0
+                self.current_heading = delta / (np.linalg.norm(delta) + 1e-6)
+
             features = self.extract_terrain_features()
             self.terrain_features.append(features)
             self.path_points.append(features.centroid.copy())
@@ -681,8 +928,11 @@ class CenterlineNavigator:
             )
 
             if self.centerline_navigation_step():
-                print(f"Goal reached in {step + 1} steps!")
-                return True
+                if self.state == NavigationState.GOAL_REACHED:
+                    print(f"Goal reached in {step + 1} steps!")
+                    return True
+                print(f"Navigation blocked after {step + 1} steps: no safe ground-supported step")
+                return False
 
         print(f"Navigation terminated after {max_steps} steps")
         return False
