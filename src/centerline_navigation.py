@@ -174,7 +174,8 @@ class CenterlineNavigator:
                 continue
             x = x_all[selected]
             y = y_all[selected]
-            z = np.asarray(las_chunk.z[selected])
+            z_all = np.asarray(las_chunk.z)
+            z = z_all[selected]
             cls = np.asarray(getattr(las_chunk, class_field)[selected], dtype=np.float32)
             point_chunks.append(np.column_stack((x, y, z)))
             class_chunks.append(cls)
