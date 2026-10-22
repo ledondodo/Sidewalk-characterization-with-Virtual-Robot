@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# Large source point clouds stay outside version control.
+data/*.las
+data/*.laz
+
+# Keep the results folder guide, but not generated outputs.
+results/*
+!results/README.md
