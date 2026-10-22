@@ -1,152 +1,21 @@
-## Dataset Download
+# Input data
 
-The point cloud dataset used in this study is publicly available on Zenodo:
+Large point clouds are not stored in this repository. The sample runner uses
+the recordings in the neighboring `Data Samples/LiDAR Recordings/` folder by
+default, so there is no need to copy them into this directory. To use a file
+elsewhere, pass its path with `--input`.
 
-**DOI:** https://doi.org/10.5281/zenodo.19354886
+## Supported class dimensions
 
-Download the file and place it in this `data/` directory,
-then update the path in `examples/run_example.py`.
-\# Data
+The loader detects these point-cloud dimensions:
 
-
-
-This directory is intentionally empty in the public repository.
-
-Large LiDAR point cloud files (`.las`, `.laz`) are not committed to Git.
-
-
-
-\---
-
-
-
-\## Dataset Description
-
-
-
-The algorithm expects a classified 3D LiDAR point cloud in \*\*LAS format\*\*.
-
-
-
-\### Source
-
-
-
-The point cloud dataset used in the published paper was collected in the area of
-
-\*\*Victoriaville, Quebec, Canada\*\* by \[Groupe Trifide](https://www.groupetrifide.com/).
-
-
-
-\- \*\*Horizontal coordinate system:\*\* NAD1983 MTM Zone 7
-
-\- \*\*Vertical coordinate system:\*\* NAD1983
-
-\- \*\*Annotation tool:\*\* CloudCompare
-
-\- \*\*Total semantic classes:\*\* 35 distinct classes
-
-
-
-\### LAS File Requirements
-
-
-
-Your `.las` file must contain:
-
-
-
-| Attribute | Description |
-
+| Dimension | Default navigable values |
 |---|---|
+| `Label` | 1111–1116 and 1810 (paper dataset) |
+| `ModelClass` | 1 (ground in the supplied samples) |
+| `classification` | 2 (LAS standard ground class) |
 
-| `x`, `y`, `z` | 3D coordinates in a projected coordinate system (meters) |
+For a different label map, set `NavigationConfig.navigable_classes` to the
+values representing the walkable surface.
 
-| `Label` | Semantic class label stored as a float field |
-
-
-
-The field must be named \*\*`Label`\*\* exactly (case-sensitive), as accessed via `las\_file.Label`.
-
-
-
-\### Navigable Class Codes
-
-
-
-The following Label values are treated as navigable surfaces by default:
-
-
-
-| Code | Surface Type |
-
-|---|---|
-
-| 1111.00 | Sidewalk |
-
-| 1112.00 | Path |
-
-| 1113.00 | Parking lot |
-
-| 1114.00 | Bare surface |
-
-| 1115.00 | Curb cut |
-
-| 1116.00 | Crosswalk |
-
-| 1810.00 | Additional navigable surface |
-
-
-
-All other class codes are treated as obstacles (vegetation, buildings, roads, etc.).
-
-Customize the list in `NavigationConfig.navigable\_classes`.
-
-
-
-\### How to Prepare Your Own Dataset
-
-
-
-1\. Collect or download a 3D LiDAR point cloud of a pedestrian area.
-
-2\. Semantically annotate it using a tool such as \[CloudCompare](https://www.cloudcompare.org/).
-
-3\. Assign class codes to a field named `Label`.
-
-4\. Export as a `.las` file.
-
-5\. Place the file in this `data/` directory.
-
-6\. Update the path in `examples/run\_example.py`.
-
-
-
-\### Recommended Parameter Settings
-
-
-
-| Scenario | `open\_space\_grid\_size` | `step\_size` | Notes |
-
-|---|---|---|---|
-
-| Narrow passages / building entrances | 0.05–0.10 m | 0.20–0.30 m | Captures small obstacles and terrain transitions |
-
-| Open sidewalks | 0.05–0.20 m | 0.30–0.50 m | Balances accuracy and speed |
-
-| Ramp areas | 0.05–0.10 m | 0.20–0.30 m | Captures rapid slope changes |
-
-
-
-\---
-
-
-
-\## Contact for Dataset Access
-
-
-
-For access to the Victoriaville dataset used in the paper, contact:
-
-\*\*ali.ahmadi.2@ulaval.ca\*\*
-
+The Victoriaville dataset used in the paper is available from [Zenodo](https://doi.org/10.5281/zenodo.19354886).
