@@ -89,7 +89,7 @@ def main() -> None:
     parser.add_argument("--max-points", type=int, help="Randomly retain at most this many points when loading a large cloud")
     parser.add_argument("--route-padding", type=float, default=30.0, help="Spatial margin around explicit start/goal, in meters")
     parser.add_argument("--open-space-grid-size", type=float, default=0.05, help="Obstacle proximity threshold in meters")
-    parser.add_argument("--output", type=Path, help="CSV output path; defaults to <input name>_path.csv")
+    parser.add_argument("--output", type=Path, help="CSV output path; defaults to <input name>.csv")
     args = parser.parse_args()
 
     las_path = args.input.expanduser().resolve()
@@ -114,7 +114,7 @@ def main() -> None:
         )
 
     input_name = las_path.stem
-    output_file = args.output or (REPO_ROOT / "results" / f"{input_name}_path.csv")
+    output_file = args.output or (REPO_ROOT / "results" / f"{input_name}.csv")
 
     config = NavigationConfig(
         triangle_side_length=0.8,
