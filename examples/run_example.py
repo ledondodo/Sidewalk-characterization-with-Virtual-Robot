@@ -89,7 +89,7 @@ def main() -> None:
     parser.add_argument("--max-points", type=int, help="Randomly retain at most this many points when loading a large cloud")
     parser.add_argument("--route-padding", type=float, default=30.0, help="Spatial margin around explicit start/goal, in meters")
     parser.add_argument("--open-space-grid-size", type=float, default=0.05, help="Obstacle proximity threshold in meters")
-    parser.add_argument("--output", type=Path, help="CSV output path; defaults to <input name>_output.csv")
+    parser.add_argument("--output", type=Path, help="CSV output path; defaults to <input name>_path.csv")
     args = parser.parse_args()
 
     las_path = args.input.expanduser().resolve()
@@ -114,13 +114,7 @@ def main() -> None:
         )
 
     input_name = las_path.stem
-    if input_name.startswith("SlamProject-"):
-        input_name = input_name.removeprefix("SlamProject-")
-    for suffix in ("_classified_with_modelclass", "_classified_modelclass", "_classified"):
-        if input_name.endswith(suffix):
-            input_name = input_name.removesuffix(suffix)
-            break
-    output_file = args.output or (REPO_ROOT / "results" / f"{input_name}_output.csv")
+    output_file = args.output or (REPO_ROOT / "results" / f"{input_name}_path.csv")
 
     config = NavigationConfig(
         triangle_side_length=0.8,
